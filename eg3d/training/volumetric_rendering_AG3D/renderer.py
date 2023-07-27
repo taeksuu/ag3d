@@ -17,6 +17,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.autograd as autograd
+import pytorch3d.ops as ops
 
 from training.volumetric_rendering_AG3D.ray_marcher import MipRayMarcher2
 from training.volumetric_rendering_AG3D import math_utils
@@ -290,76 +291,100 @@ class ImportanceRenderer(torch.nn.Module):
 
     def run_model(self, planes, smpl, decoder, canonical, sample_coordinates, sample_directions, options):
 
-        b, _ = smpl.shape
-
-        if not canonical:
-            smpl_output = self.smpl_server(smpl, absolute=True)
-
-            # import open3d as o3d
-            # verts = smpl_output['smpl_verts'][0]
-            # verts = verts.cpu().numpy()
-            # faces = smpl_output['faces']
-            # mesh = o3d.geometry.TriangleMesh()
-            # mesh.vertices = o3d.utility.Vector3dVector(verts)
-            # mesh.triangles = o3d.utility.Vector3iVector(faces)
-            # mesh.compute_vertex_normals()
-
-            smpl_tfs = smpl_output['smpl_tfs']
-            smpl_tfs = torch.einsum('bnij,njk->bnik', smpl_tfs.to(smpl.device), self.smpl_server.tfs_c_inv.to(smpl.device))
-
-            pts_c, intermediates = self.deformer(sample_coordinates, {}, smpl_tfs)
-            num_batch, num_point, num_init, num_dim = pts_c.shape
-            pts_c = pts_c.reshape(num_batch, num_point * num_init, num_dim)
-            mask = intermediates['valid_ids'].reshape(num_batch, -1)
-            if mask.sum() == 0: mask = torch.ones((num_batch, num_point * num_init), device=pts_c.device, dtype=torch.bool)
-
-        else:
-            pts_c = sample_coordinates
-            num_batch, num_point, num_dim = pts_c.shape
-
-        sampled_features = sample_from_planes(self.plane_axes, planes, pts_c, padding_mode='zeros', box_warp=options['box_warp'])
-        sampled_features = sampled_features.mean(1)
-
-        if not canonical:
-            sampled_features = sampled_features[mask]
-            pts_c = pts_c[mask]
-
-            out = decoder(sampled_features, sample_directions)
-
-            sdf_grid = torch.tensor(self.precomputed_sdf_grid).to(sampled_features.device)
-            queried_sdf = torch.nn.functional.grid_sample(sdf_grid, pts_c[None][:,:,None,None,:3], padding_mode='border', align_corners=True)
-            queried_sdf = queried_sdf.reshape(-1, 1)
-            sdf = queried_sdf + out['delta_sdf']
+        num_batch_final, num_point_final, num_dim_final = sample_coordinates.shape
         
-            sigma = torch.zeros((num_batch, num_point * num_init, 1),  device=pts_c.device)
-            rgb = torch.zeros((num_batch, num_point * num_init, 32),  device=pts_c.device)
-            sigma[mask] = torch.sigmoid(-sdf / self.sigmoid_beta) / self.sigmoid_beta
-            pts_c_ = torch.zeros((num_batch, num_point * num_init, 3), device=pts_c.device)
-            pts_c_[mask] = pts_c
-            pts_c = pts_c_
-            rgb[mask] = out['rgb']
-            out['sigma'] = sigma
-            out['rgb'] = rgb
+        smpl_output = self.smpl_server(smpl, absolute=True)
+        smpl_tfs, smpl_verts = smpl_output['smpl_tfs'], smpl_output['smpl_verts']
+        smpl_tfs = torch.einsum('bnij,njk->bnik', smpl_tfs.to(smpl.device), self.smpl_server.tfs_c_inv.to(smpl.device))
 
-            out['sigma'] = out['sigma'].reshape(num_batch, -1, num_init, 1)
-            out['rgb'] = out['rgb'].reshape(num_batch, -1, num_init, 32)
-            pts_c = pts_c.reshape(num_batch, -1, num_init, 3)
-            # sampled_features = sampled_features.reshape(num_batch, 3, -1, num_init, 32)
+        # will set density=0 if points are far from predicted SMPL vertices
+        distance, index, _  = ops.knn_points(sample_coordinates, smpl_verts[:,::10,:], K=1, return_nn=False)
+        mask_smpl = torch.ones((num_batch_final, num_point_final), device=sample_coordinates.device, dtype=torch.bool)
+        mask_smpl = mask_smpl & (distance < 0.15).squeeze(2)
+        if mask_smpl.sum() == 0: mask_smpl = torch.ones((num_batch_final, num_point_final), device=sample_coordinates.device, dtype=torch.bool)
+        # sample_coordinates = sample_coordinates[mask_smpl][None]
 
-            out['sigma'], idx_c = out['sigma'].max(dim=2)
-            out['rgb'] = torch.gather(out['rgb'], 2, idx_c.unsqueeze(-1).expand(-1,-1, 1, out['rgb'].shape[-1])).squeeze(2)
-            pts_c = torch.gather(pts_c, 2, idx_c.unsqueeze(-1).expand(-1,-1, 1, pts_c.shape[-1])).squeeze(2) 
-            # sampled_features = torch.gather(sampled_features, 3, idx_c.unsqueeze(-1).unsqueeze(1).expand(-1,3, -1, 1, sampled_features.shape[-1])).squeeze(3)
+        # placeholder for final outputs
+        sigma_final = torch.zeros((num_batch_final, num_point_final, 1),  device=sample_coordinates.device)
+        rgb_final = torch.zeros((num_batch_final, num_point_final, 32),  device=sample_coordinates.device)
+        pts_c_final = torch.zeros((num_batch_final, num_point_final, 3),  device=sample_coordinates.device)
 
-        else:
-            out = decoder(sampled_features, sample_directions)
+        for b in range(num_batch_final):
+            mask_smpl_ = mask_smpl[b][None]
+            if not canonical:
+                pts_c, intermediates = self.deformer(sample_coordinates[b][None], {}, smpl_tfs)
+                num_batch, num_point, num_init, num_dim = pts_c.shape
+                pts_c = pts_c.reshape(num_batch, num_point * num_init, num_dim)
+                mask = intermediates['valid_ids'].reshape(num_batch, -1)
+                if mask.sum() == 0: mask = torch.ones((num_batch, num_point * num_init), device=pts_c.device, dtype=torch.bool)
+                mask = torch.repeat_interleave(mask_smpl_, num_init, dim=1) & mask
 
-            sdf_grid = torch.tensor(self.precomputed_sdf_grid).to(sampled_features.device)
-            queried_sdf = torch.nn.functional.grid_sample(sdf_grid.repeat(num_batch, 1, 1, 1, 1), pts_c[:,:,None,None,:3], padding_mode='border', align_corners=True)
-            queried_sdf = queried_sdf.reshape(num_batch, 1, -1).transpose(1,2)
-            sdf = queried_sdf + out['delta_sdf']
+                pts_c = pts_c[mask]
 
-            out['sigma'] = torch.sigmoid(-sdf / self.sigmoid_beta) / self.sigmoid_beta
+            else:
+                pts_c = sample_coordinates[b][None]
+                num_batch, num_point, num_dim = pts_c.shape
+                pts_c = pts_c[mask_smpl_]
+
+            sampled_features = sample_from_planes(self.plane_axes, planes[b][None], pts_c[None], padding_mode='zeros', box_warp=options['box_warp'])
+            sampled_features = sampled_features.mean(1)
+
+            if not canonical:
+                # sampled_features = sampled_features[mask]
+            
+                out = decoder(sampled_features, sample_directions)
+
+                sdf_grid = torch.tensor(self.precomputed_sdf_grid).to(sampled_features.device)
+                queried_sdf = torch.nn.functional.grid_sample(sdf_grid, pts_c[None][:,:,None,None,:3], padding_mode='border', align_corners=True)
+                queried_sdf = queried_sdf.reshape(-1, 1)
+                sdf = queried_sdf + out['delta_sdf']
+            
+                sigma = torch.zeros((num_batch, num_point * num_init, 1),  device=pts_c.device)
+                rgb = torch.zeros((num_batch, num_point * num_init, 32),  device=pts_c.device)
+                sigma[mask] = torch.sigmoid(-sdf / self.sigmoid_beta) / self.sigmoid_beta
+                pts_c_ = torch.zeros((num_batch, num_point * num_init, 3), device=pts_c.device)
+                pts_c_[mask] = pts_c
+                pts_c = pts_c_
+                rgb[mask] = out['rgb']
+
+                sigma = sigma.reshape(num_batch, -1, num_init, 1)
+                rgb = rgb.reshape(num_batch, -1, num_init, 32)
+                pts_c = pts_c.reshape(num_batch, -1, num_init, 3)
+                # sampled_features = sampled_features.reshape(num_batch, 3, -1, num_init, 32)
+
+                out['sigma'], idx_c = sigma.max(dim=2)
+                out['rgb'] = torch.gather(rgb, 2, idx_c.unsqueeze(-1).expand(-1,-1, 1, rgb.shape[-1])).squeeze(2)
+                pts_c = torch.gather(pts_c, 2, idx_c.unsqueeze(-1).expand(-1,-1, 1, pts_c.shape[-1])).squeeze(2) 
+                # sampled_features = torch.gather(sampled_features, 3, idx_c.unsqueeze(-1).unsqueeze(1).expand(-1,3, -1, 1, sampled_features.shape[-1])).squeeze(3)
+
+                sigma_final[b] = out['sigma']
+                rgb_final[b] = out['rgb']
+                pts_c_final[b] = pts_c
+
+            else:
+                # sampled_features = sampled_features[mask_smpl_]
+                # pts_c = pts_c[mask_smpl_]
+
+                out = decoder(sampled_features, sample_directions)
+
+                sdf_grid = torch.tensor(self.precomputed_sdf_grid).to(sampled_features.device)
+                queried_sdf = torch.nn.functional.grid_sample(sdf_grid, pts_c[None][:,:,None,None,:3], padding_mode='border', align_corners=True)
+                queried_sdf = queried_sdf.reshape(-1, 1)
+                sdf = queried_sdf + out['delta_sdf']
+
+                sigma = torch.zeros((num_batch, num_point, 1),  device=pts_c.device)
+                rgb = torch.zeros((num_batch, num_point, 32),  device=pts_c.device)
+                sigma[mask_smpl_] = torch.sigmoid(-sdf / self.sigmoid_beta) / self.sigmoid_beta
+                rgb[mask_smpl_] = out['rgb']
+
+                out['sigma'] = sigma
+                out['rgb'] = rgb
+
+                sigma_final[b] = out['sigma']
+                rgb_final[b] = out['rgb']
+
+        out['sigma'] = sigma_final
+        out['rgb'] = rgb_final
             
         
         out['deformer_weight_diffs'] = 0
@@ -368,16 +393,21 @@ class ImportanceRenderer(torch.nn.Module):
         loss_eik = 0
         if not canonical:
             with torch.enable_grad():
-                pts_c_ = pts_c.clone().detach()
+                pts_c_ = pts_c_final.clone().detach()
                 pts_c_.requires_grad_()
+                
                 sampled_features = sample_from_planes(self.plane_axes, planes, pts_c_, padding_mode='zeros', box_warp=options['box_warp'])
                 sampled_features = sampled_features.mean(1)
+
+                # sampled_features = sampled_features[mask_smpl[0][None]]
+                # pts_c_ = pts_c_[mask_smpl[0][None]]
+
                 out_ = decoder(sampled_features, sample_directions)['delta_sdf']
                 normal = autograd.grad(out_, pts_c_, grad_outputs=torch.ones_like(out_, device=out_.device),
-                                            create_graph=True)[0].view(num_batch,-1, 3)
+                                            create_graph=True)[0].view(num_batch_final,-1, 3)
                 
-            mask = torch.gather(mask.reshape(num_batch, -1, num_init, 1), 2, idx_c.unsqueeze(-1).expand(-1,-1, 1, 1)).squeeze(2)
-            normal = normal[~mask.squeeze(-1)] 
+            # mask = torch.gather(mask.reshape(num_batch, -1, num_init, 1), 2, idx_c.unsqueeze(-1).expand(-1,-1, 1, 1)).squeeze(2)
+            normal = normal[mask_smpl] 
         
             loss_eik = (torch.norm(normal, p=2, dim=1) - 1).pow(2).mean()
         out['normal'] = loss_eik
